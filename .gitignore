@@ -12,6 +12,11 @@ wheels/
 # GGUF output files
 *.gguf
 
+llama.cpp/
+data/
+compare_out*/
+*.log
+
 # IDE
 .idea/
 .vscode/

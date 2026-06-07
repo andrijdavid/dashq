@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - name: Run core self-test
+        run: uv run python -m dashq.dash_q
+      - name: Test packing (all formats)
+        run: |
+          uv run python -c "
+          import torch, numpy as np
+          from dashq import quantize_layer, dequantize, PAPER_GROUP_SIZES
+          from dashq.export import pack_tensor, gguf_type_for_bits, byte_shape_for_tensor, QUANT_REGISTRY
+          import gguf
+
+          torch.manual_seed(42)
+          W = torch.randn(128, 512)
+          X = torch.randn(64, 512)
+
+          for bits in [2, 3, 4]:
+              gs = PAPER_GROUP_SIZES[bits]
+              Q, S, Z = quantize_layer(W, X, b=bits)
+              W_hat = dequantize(Q, S, Z, gs)
+              raw, bs, bpb = pack_tensor(W_hat, bits)
+              expected = 128 * (512 // bs) * bpb
+              assert len(raw) == expected, f'{bits}-bit: {len(raw)} != {expected}'
+
+              qtype = gguf_type_for_bits(bits)
+              bshape = byte_shape_for_tensor(W.shape, bits)
+              writer = gguf.GGUFWriter(f'test_{qtype.name}.gguf', 'test')
+              data = np.frombuffer(raw, dtype=np.uint8)
+              writer.add_tensor('w', data, raw_dtype=qtype, raw_shape=bshape)
+              writer.write_header_to_file()
+              writer.write_kv_data_to_file()
+              writer.write_tensors_to_file()
+              print(f'{qtype.name}: OK ({len(raw)} bytes)')
+
+          print('All packing tests passed')
+          "
