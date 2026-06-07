@@ -26,8 +26,14 @@ Notes:
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+# Python used for the convert / quantise sub-processes. Defaults to the current
+# interpreter (so `uv run python compare.py` keeps using the project venv, and a
+# bare `python compare.py` on e.g. Kaggle just reuses that environment).
+PYTHON = sys.executable
 
 REPO = Path(__file__).resolve().parent
 LLAMA_DIR = REPO / "llama.cpp"
@@ -54,7 +60,7 @@ def ensure_f16(model_id: str, out_dir: Path) -> Path:
         return f16
     from huggingface_hub import snapshot_download
     local = Path(snapshot_download(model_id, allow_patterns=["*.json", "*.model", "*.safetensors"]))
-    run(["uv", "run", "python", str(CONVERT_PY), str(local),
+    run([PYTHON, str(CONVERT_PY), str(local),
          "--outfile", str(f16), "--outtype", "f16"])
     return f16
 
@@ -75,7 +81,7 @@ def run_dashq(model_id: str, bits: int, out_dir: Path,
     out = out_dir / f"{bits}-{tag}.gguf"
     if out.exists():
         return out
-    cmd = ["uv", "run", "python", str(REPO / "quantize_hf.py"),
+    cmd = [PYTHON, str(REPO / "quantize_hf.py"),
            "--model_id", model_id,
            "--bits", str(bits),
            "--n_samples", str(n_samples),
@@ -89,16 +95,21 @@ def run_dashq(model_id: str, bits: int, out_dir: Path,
     return out
 
 
-def measure_ppl(gguf: Path, ppl_file: Path, ctx: int) -> dict:
-    """Run llama-perplexity. Returns {'ppl': float, 'time_s': float} or {}."""
+def measure_ppl(gguf: Path, ppl_file: Path, ctx: int, chunks: int = 0) -> dict:
+    """Run llama-perplexity. Returns {'ppl': float, 'time_s': float} or {}.
+
+    chunks > 0 caps the number of evaluated windows (`--chunks`), which keeps
+    CPU-only runs tractable. All variants must use the same value to stay
+    comparable.
+    """
     bin_ = LLAMA_BIN / "llama-perplexity"
     if not bin_.exists():
         return {}
+    cmd = [str(bin_), "-m", str(gguf), "-f", str(ppl_file), "-c", str(ctx)]
+    if chunks > 0:
+        cmd += ["--chunks", str(chunks)]
     t0 = time.time()
-    proc = subprocess.run(
-        [str(bin_), "-m", str(gguf), "-f", str(ppl_file), "-c", str(ctx)],
-        capture_output=True, text=True, check=False,
-    )
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     dt = time.time() - t0
     # llama-perplexity prints "Final estimate: PPL = <value> +/- <err>"
     ppl = None
@@ -130,6 +141,8 @@ def main():
     p.add_argument("--ppl_file", default=None,
                    help="wiki.test.raw or similar; if omitted, only file sizes are reported")
     p.add_argument("--ctx", type=int, default=512, help="ctx size for llama-perplexity")
+    p.add_argument("--ppl_chunks", type=int, default=0,
+                   help="cap llama-perplexity windows (0 = full file). Keeps CPU runs tractable.")
     p.add_argument("--n_samples", type=int, default=16)
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--calib_format", default="raw", choices=["raw", "chat"])
@@ -144,7 +157,7 @@ def main():
     f16 = ensure_f16(args.model_id, out_dir)
 
     rows = []
-    f16_ppl = measure_ppl(f16, ppl_path, args.ctx) if ppl_path else {}
+    f16_ppl = measure_ppl(f16, ppl_path, args.ctx, args.ppl_chunks) if ppl_path else {}
     rows.append({"bits": "16", "variant": "F16", "path": str(f16),
                  "size_mb": file_size_mb(f16), **f16_ppl})
 
@@ -169,7 +182,7 @@ def main():
             row = {"bits": bits, "variant": label, "path": str(g),
                    "size_mb": file_size_mb(g)}
             if ppl_path:
-                row.update(measure_ppl(g, ppl_path, args.ctx))
+                row.update(measure_ppl(g, ppl_path, args.ctx, args.ppl_chunks))
             rows.append(row)
 
     # Markdown table
