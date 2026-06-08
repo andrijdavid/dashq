@@ -253,7 +253,29 @@ def quantize_and_export(
 
     hparams = ModelBase.load_hparams(Path(local_dir), False)
     arch = hparams["architectures"][0]
-    ModelClass = ModelBase.from_model_architecture(arch)
+    # Resolve the converter class through the lazy loader. `from_model_architecture`
+    # alone never imports the per-arch module, so the registry is empty and every
+    # lookup raises. For multimodal checkpoints (e.g. Qwen3.5 ships as
+    # `*ForConditionalGeneration`) prefer the text `*ForCausalLM` converter, which
+    # is what we quantise.
+    candidates = [arch]
+    if arch.endswith("ForConditionalGeneration"):
+        candidates.insert(0, arch.replace("ForConditionalGeneration", "ForCausalLM"))
+    try:
+        from conversion import get_model_class
+    except Exception:
+        get_model_class = None
+    ModelClass = None
+    for cand in candidates:
+        try:
+            ModelClass = (get_model_class(cand) if get_model_class
+                          else ModelBase.from_model_architecture(cand))
+            break
+        except (NotImplementedError, KeyError):
+            continue
+    if ModelClass is None:
+        raise NotImplementedError(
+            f"None of {candidates} is supported by the bundled converter")
 
     print("Extracting metadata for GGUF...")
     ftype = gguf.LlamaFileType.MOSTLY_Q2_K if bits == 2 else gguf.LlamaFileType.MOSTLY_Q3_K_M if bits == 3 else gguf.LlamaFileType.MOSTLY_Q4_0
