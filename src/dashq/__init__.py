@@ -5,6 +5,7 @@ from dashq.dash_q import (  # noqa: F401
     dash_q_group,
     dequantize,
     quantize_layer,
+    quantize_layer_from_hessian,
 )
 from dashq.export import (  # noqa: F401
     QUANT_REGISTRY,
@@ -22,4 +23,5 @@ __all__ = [
     "gguf_type_for_bits",
     "pack_tensor",
     "quantize_layer",
+    "quantize_layer_from_hessian",
 ]

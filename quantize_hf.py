@@ -27,7 +27,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "llama.cpp", "gguf-py
 import gguf
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from dashq.dash_q import quantize_layer, dequantize, PAPER_GROUP_SIZES
+from dashq.dash_q import (
+    quantize_layer,
+    quantize_layer_from_hessian,
+    dequantize,
+    PAPER_GROUP_SIZES,
+)
 from dashq.export import (
     QUANT_REGISTRY,
     pack_tensor,
@@ -302,54 +307,57 @@ def quantize_and_export(
     }
     print(f"Found {len(linear_layers)} linear layers.\n")
 
-    # -- Quantise layer by layer --------------------------------------------
-    for name, module in tqdm(linear_layers.items(), desc="Quantising"):
-        # Skip the language-model head (kept in fp16)
+    # -- Decide which layers to quantise -----------------------------------
+    # Skip the language-model head (kept in fp16) and any layer whose
+    # in_features is not divisible by the DASH-Q group size or the target
+    # GGUF block size (Q2_K/Q3_K need multiples of 256, Q4_1 needs 32,
+    # native DASHQ_2/3 need 32/64). Skipped layers stay F16.
+    target_block = QUANT_REGISTRY[bits][2] if not (native and bits in (2, 3)) else (32 if bits == 2 else 64)
+    targets = {}
+    for name, module in linear_layers.items():
         if "lm_head" in name:
             continue
-
-        # Skip layers whose in_features is not divisible by the DASH-Q
-        # group size or the target GGUF block size (e.g. Q2_K/Q3_K need
-        # multiples of 256, Q4_1 needs 32). Skipped layers stay F16.
-        target_block = QUANT_REGISTRY[bits][2] if not (native and bits in (2, 3)) else (32 if bits == 2 else 64)
         if module.in_features % dashq_group_size != 0 or module.in_features % target_block != 0:
             print(f"  Skipping {name} (in_features={module.in_features} not "
                   f"divisible by dashq_group={dashq_group_size} or block={target_block})")
             continue
+        targets[name] = module
+    print(f"Quantising {len(targets)} layers.\n")
 
-        print(f"  {name}  ({module.out_features} x {module.in_features})")
+    # -- Accumulate the diagonal Hessian for every target in ONE pass -------
+    # DASH-Q only needs h_jj = sum_k x_kj^2 per layer, not the full
+    # activations, so we hook all targets at once and stream the calibration
+    # set through the model a single time (instead of re-running it per layer).
+    hessians = {name: torch.zeros(m.in_features, dtype=torch.float32, device=device)
+                for name, m in targets.items()}
 
-        # 1. Capture activations via a forward hook
-        layer_inputs = []
+    def _make_hook(layer_name):
+        def _hook(_mod, inp, _out):
+            x = inp[0].detach()
+            x = x.reshape(-1, x.shape[-1]).float()
+            hessians[layer_name] += (x * x).sum(dim=0)
+        return _hook
 
-        def _hook(_mod, inp, _out, storage=layer_inputs):
-            storage.append(inp[0].detach().cpu())
+    handles = [m.register_forward_hook(_make_hook(name)) for name, m in targets.items()]
+    chunk_size = max(1, min(4, n_samples))
+    for i in tqdm(range(0, len(calib_inputs), chunk_size), desc="Calibrating"):
+        batch = calib_inputs[i : i + chunk_size].to(device)
+        model(batch)
+    for h in handles:
+        h.remove()
 
-        handle = module.register_forward_hook(_hook)
-
-        # Feed calibration data through the full model
-        chunk_size = max(1, min(4, n_samples))
-        for i in range(0, len(calib_inputs), chunk_size):
-            batch = calib_inputs[i : i + chunk_size].to(device)
-            model(batch)
-
-        handle.remove()
-
-        # Flatten activations to (total_tokens, in_features)
-        X = torch.cat(layer_inputs, dim=0)
-        X = X.reshape(-1, X.shape[-1]).float().to(device)
-
-        # 2. Run DASH-Q
+    # -- Quantise each target from its accumulated Hessian ------------------
+    for name, module in tqdm(targets.items(), desc="Quantising"):
         W = module.weight.data.clone().float().to(device)
-        Q, S, Z = quantize_layer(
-            W, X, b=bits,
+        Q, S, Z = quantize_layer_from_hessian(
+            W, hessians[name], b=bits,
             group_size=dashq_group_size,
             T=iters,
             alpha=alpha,
             lambda_reg=lambda_reg,
         )
 
-        # 3. Pack weights into GGUF tensor format
+        # Pack weights into GGUF tensor format
         if native and bits in (2, 3):
             # Native DASH-Q format -- no re-quantisation loss
             n_rows, n_cols = W.shape
@@ -393,7 +401,8 @@ def quantize_and_export(
             quantized_hf_layers[name + ".weight"] = (raw_data, tensor_type, bshape)
 
         # Free memory
-        del X, W, Q, S, Z, layer_inputs
+        del hessians[name]
+        del W, Q, S, Z
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()

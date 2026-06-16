@@ -127,6 +127,32 @@ def quantize_layer(
         S_full: Scales         (out_features, num_groups).
         Z_full: Zero-points    (out_features, num_groups).
     """
+    # Diagonal Hessian: h_jj = sum_k x_{kj}^2  (Section 5)
+    H_diag = (X ** 2).sum(dim=0)  # shape: (in_features,)
+    return quantize_layer_from_hessian(
+        W, H_diag, b, group_size=group_size, T=T, alpha=alpha, lambda_reg=lambda_reg
+    )
+
+
+def quantize_layer_from_hessian(
+    W: torch.Tensor,
+    H_diag: torch.Tensor,
+    b: int,
+    group_size: int | None = None,
+    T: int = 9,
+    alpha: float = 0.5,
+    lambda_reg: float = 1e-2,
+):
+    """Same as :func:`quantize_layer` but takes a precomputed diagonal Hessian.
+
+    Lets the caller accumulate ``H = sum_k x_k^2`` for every layer in a single
+    forward pass instead of re-running the model once per layer.
+
+    Args:
+        W:      Weight tensor (out_features, in_features).
+        H_diag: Diagonal Hessian (in_features,), i.e. sum over calibration
+                tokens of x_{kj}^2.
+    """
     # Default to paper-recommended group size if not specified
     if group_size is None:
         group_size = PAPER_GROUP_SIZES.get(b, 128)
@@ -135,10 +161,11 @@ def quantize_layer(
     assert in_features % group_size == 0, (
         f"in_features ({in_features}) must be divisible by group_size ({group_size})"
     )
+    assert H_diag.shape[-1] == in_features, (
+        f"H_diag length ({H_diag.shape[-1]}) must match in_features ({in_features})"
+    )
     num_groups = in_features // group_size
-
-    # Diagonal Hessian: h_jj = sum_k x_{kj}^2  (Section 5)
-    H_diag = (X ** 2).sum(dim=0)  # shape: (in_features,)
+    H_diag = H_diag.to(W.device, W.dtype)
 
     Q_full = torch.zeros_like(W)
     S_full = torch.zeros((out_features, num_groups), dtype=W.dtype, device=W.device)

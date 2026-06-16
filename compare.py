@@ -124,13 +124,20 @@ def measure_ppl(gguf: Path, ppl_file: Path, ctx: int, chunks: int = 0) -> dict:
     return {"ppl": ppl, "time_s": dt}
 
 
-def variants_for(bits: int) -> list[tuple[str, str]]:
-    """Return [(variant_tag, label), ...] for a given bit width."""
-    out = [("rtn", f"{RTN_TYPE[bits]} (RTN)"),
-           ("dashq-repack", f"{RTN_TYPE[bits]} (DASH-Q repack)")]
+ALL_VARIANTS = ["rtn", "dashq-repack", "dashq-native"]
+
+
+def variants_for(bits: int, selected: list[str]) -> list[tuple[str, str]]:
+    """Return [(variant_tag, label), ...] for a given bit width.
+
+    `selected` filters which paths to build (subset of ALL_VARIANTS), so a run
+    can focus on e.g. native vs RTN only.
+    """
+    catalogue = [("rtn", f"{RTN_TYPE[bits]} (RTN)"),
+                 ("dashq-repack", f"{RTN_TYPE[bits]} (DASH-Q repack)")]
     if bits in (2, 3):
-        out.append(("dashq-native", f"DASHQ_{bits} (native)"))
-    return out
+        catalogue.append(("dashq-native", f"DASHQ_{bits} (native)"))
+    return [(t, lbl) for t, lbl in catalogue if t in selected]
 
 
 def main():
@@ -147,6 +154,11 @@ def main():
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--calib_format", default="raw", choices=["raw", "chat"])
     p.add_argument("--max_rows", type=int, default=128)
+    p.add_argument("--variants", nargs="+", default=ALL_VARIANTS, choices=ALL_VARIANTS,
+                   help="which quant paths to build/eval (default: all)")
+    p.add_argument("--no_f16_ppl", action="store_true",
+                   help="skip the F16 perplexity row (still converts F16, which RTN needs). "
+                        "Use when F16 is not an apples-to-apples comparison point.")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -157,12 +169,14 @@ def main():
     f16 = ensure_f16(args.model_id, out_dir)
 
     rows = []
-    f16_ppl = measure_ppl(f16, ppl_path, args.ctx, args.ppl_chunks) if ppl_path else {}
-    rows.append({"bits": "16", "variant": "F16", "path": str(f16),
-                 "size_mb": file_size_mb(f16), **f16_ppl})
+    f16_ppl = (measure_ppl(f16, ppl_path, args.ctx, args.ppl_chunks)
+               if (ppl_path and not args.no_f16_ppl) else {})
+    if not args.no_f16_ppl:
+        rows.append({"bits": "16", "variant": "F16", "path": str(f16),
+                     "size_mb": file_size_mb(f16), **f16_ppl})
 
     for bits in args.bits:
-        for tag, label in variants_for(bits):
+        for tag, label in variants_for(bits, args.variants):
             print(f"\n== bits={bits} variant={label}")
             try:
                 if tag == "rtn":
@@ -185,15 +199,24 @@ def main():
                 row.update(measure_ppl(g, ppl_path, args.ctx, args.ppl_chunks))
             rows.append(row)
 
+    # Per-bit RTN baseline so we can show how each variant moves vs RTN
+    # (the comparison the project actually cares about).
+    rtn_ppl = {r["bits"]: r.get("ppl") for r in rows
+               if isinstance(r.get("variant"), str) and "(RTN)" in r["variant"]}
+
     # Markdown table
-    md = ["| bits | variant | size (MB) | PPL | PPL vs F16 |",
-          "|------|---------|-----------|-----|------------|"]
-    base_ppl = f16_ppl.get("ppl") if f16_ppl else None
+    md = ["| bits | variant | size (MB) | PPL | vs RTN |",
+          "|------|---------|-----------|-----|--------|"]
     for r in rows:
         size = f"{r['size_mb']:.1f}" if r.get("size_mb") is not None else "-"
         ppl = r.get("ppl")
         ppl_s = f"{ppl:.4f}" if ppl is not None else "-"
-        delta = f"{(ppl - base_ppl):+.4f}" if (ppl is not None and base_ppl) else "-"
+        base = rtn_ppl.get(r["bits"])
+        if ppl is not None and base and "(RTN)" not in str(r.get("variant", "")):
+            pct = 100.0 * (ppl - base) / base
+            delta = f"{ppl - base:+.4f} ({pct:+.1f}%)"
+        else:
+            delta = "-"
         md.append(f"| {r['bits']} | {r['variant']} | {size} | {ppl_s} | {delta} |")
     table = "\n".join(md)
     print("\n" + table)
