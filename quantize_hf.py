@@ -231,6 +231,9 @@ def quantize_and_export(
           f"T={iters}, alpha={alpha}, lambda={lambda_reg}")
 
     # -- Load model -------------------------------------------------------
+    # "auto" lets a large model shard across whatever devices are available
+    # (e.g. multiple GPUs). The per-layer ops below stay device-agnostic so
+    # this works whether the model lands on one device or many.
     print(f"Loading model '{model_id}'...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     model = AutoModelForCausalLM.from_pretrained(
@@ -328,14 +331,18 @@ def quantize_and_export(
     # DASH-Q only needs h_jj = sum_k x_kj^2 per layer, not the full
     # activations, so we hook all targets at once and stream the calibration
     # set through the model a single time (instead of re-running it per layer).
-    hessians = {name: torch.zeros(m.in_features, dtype=torch.float32, device=device)
+    # Keep each layer's accumulator on that layer's own device so a sharded
+    # model (weights spread across several GPUs) accumulates locally.
+    hessians = {name: torch.zeros(m.in_features, dtype=torch.float32,
+                                  device=m.weight.device)
                 for name, m in targets.items()}
 
     def _make_hook(layer_name):
         def _hook(_mod, inp, _out):
             x = inp[0].detach()
             x = x.reshape(-1, x.shape[-1]).float()
-            hessians[layer_name] += (x * x).sum(dim=0)
+            contrib = (x * x).sum(dim=0)
+            hessians[layer_name] += contrib.to(hessians[layer_name].device)
         return _hook
 
     handles = [m.register_forward_hook(_make_hook(name)) for name, m in targets.items()]
@@ -348,7 +355,9 @@ def quantize_and_export(
 
     # -- Quantise each target from its accumulated Hessian ------------------
     for name, module in tqdm(targets.items(), desc="Quantising"):
-        W = module.weight.data.clone().float().to(device)
+        # Run on the layer's own device (it may live on any shard); the
+        # Hessian is already there, and packing moves results to CPU.
+        W = module.weight.data.clone().float()
         Q, S, Z = quantize_layer_from_hessian(
             W, hessians[name], b=bits,
             group_size=dashq_group_size,
