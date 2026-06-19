@@ -27,77 +27,104 @@ def dash_q_group(
     lambda_reg: float = 1e-2,
 ):
     """
-    Quantize a weight group using DASH-Q coordinate descent (Algorithm 1).
+    Quantize a weight group using DASH-Q (Algorithm 1) with a k-quant-style
+    scale search.
 
-    The algorithm alternates between:
-      (1) Integer Refinement -- round weights to nearest integer grid point
-      (2) Parameter Regression -- solve closed-form weighted least squares
-          for scale s and zero-point z (Eq. 10, 11), then apply alpha-damping.
+    Two stages, both minimising the Hessian-weighted reconstruction error:
+      (1) Scale search -- sweep candidate ranges around min-max; for each,
+          assign integer codes and solve the closed-form weighted least squares
+          for scale s and zero-point z (Eq. 10, 11). Keep the per-row best.
+          This is what makes k-quant robust to outliers; here it runs on the
+          diagonal-Hessian weights so it stays activation-aware.
+      (2) Coordinate-descent refinement -- a few rounds of re-round then re-fit
+          from the best candidate. Every iterate is kept only if it lowers the
+          error, so the result never regresses.
 
     Args:
         W_group:    Float tensor (out_features, group_size).
         H_group:    Diagonal Hessian (group_size,), i.e. h_jj = sum(x_kj^2).
         b:          Number of quantization bits.
-        T:          Coordinate descent iterations (default: 9).
-        alpha:      Damping factor (default: 0.5).  New parameters are
-                    blended as  s <- alpha * s_new + (1 - alpha) * s_old.
-        lambda_reg: Ridge regulariser on s^2 (default: 1e-2). Prevents
-                    scale blow-up in near-constant weight groups.
+        T:          Refinement iterations (default: 9).
+        alpha:      Unused. Retained for backward compatibility; the
+                    best-error tracking supersedes the old damping.
+        lambda_reg: Ridge regulariser (default: 1e-2). Stabilises the least
+                    squares on near-constant weight groups.
 
     Returns:
         Q: Quantised integers (out_features, group_size), values in [0, 2^b-1].
         s: Per-row scales   (out_features, 1).
-        z: Per-row offsets  (out_features, 1).
+        z: Per-row offsets  (out_features, 1), with w_hat = s*Q - z.
     """
-    # out_features, group_size = W_group.shape
+    out_features, group_size = W_group.shape
     q_max = (2 ** b) - 1
 
-    # Broadcast H to (1, group_size) so it multiplies across rows
-    H_group = H_group.view(1, -1)
+    # Broadcast H to (1, group_size) so it multiplies across rows. The diagonal
+    # Hessian weights are per input-feature (column), shared across output rows.
+    h = H_group.view(1, -1)
+    w = W_group
+    w_min = w.min(dim=1, keepdim=True).values
+    w_max = w.max(dim=1, keepdim=True).values
+    rng = (w_max - w_min).clamp(min=1e-9)
 
-    # -- Initialisation (Eq. 12) --
-    # Standard min-max affine quantisation as the starting point.
-    w_min = W_group.min(dim=1, keepdim=True).values
-    w_max = W_group.max(dim=1, keepdim=True).values
+    # Per-row Hessian-weighted sums that don't depend on the integer codes.
+    sw = h.sum()                                   # scalar (weights shared)
+    sx = (h * w).sum(dim=1, keepdim=True)          # (out, 1)
 
-    s = (w_max - w_min) / q_max
-    s = torch.clamp(s, min=1e-8)
-    # z is a full-precision offset: q = round((w + z) / s), w_hat = s*q - z
-    z = -w_min
+    def _solve(L):
+        """Closed-form Hessian-weighted least squares for (scale, min) given the
+        integer codes L. Reconstruction is w_hat = scale*L + min, i.e. Eq. 10/11
+        with z = -min. The ridge term lambda_reg keeps it stable on flat groups.
+        """
+        sl = (h * L).sum(dim=1, keepdim=True)
+        sl2 = (h * L * L).sum(dim=1, keepdim=True)
+        sxl = (h * w * L).sum(dim=1, keepdim=True)
+        D = sw * sl2 - sl * sl + lambda_reg
+        scale = ((sw * sxl - sx * sl) / D).clamp(min=1e-8)
+        minv = (sl2 * sx - sl * sxl) / D
+        return scale, minv
 
-    # Precompute the Hessian-weighted mean of the *original* weights.
-    # This is constant across iterations since W does not change.
-    H_sum = torch.clamp(H_group.sum(), min=1e-8)
-    w_bar = (W_group * H_group).sum(dim=1, keepdim=True) / H_sum
+    best_err = torch.full((out_features, 1), float("inf"),
+                          dtype=w.dtype, device=w.device)
+    best_s = torch.ones((out_features, 1), dtype=w.dtype, device=w.device)
+    best_z = torch.zeros((out_features, 1), dtype=w.dtype, device=w.device)
+    best_Q = torch.zeros_like(w)
 
-    # -- Coordinate descent loop --
+    def _consider(L, scale, minv):
+        nonlocal best_err, best_s, best_z, best_Q
+        w_hat = scale * L + minv
+        err = (h * (w - w_hat) ** 2).sum(dim=1, keepdim=True)
+        better = err < best_err
+        best_err = torch.where(better, err, best_err)
+        best_s = torch.where(better, scale, best_s)
+        best_z = torch.where(better, -minv, best_z)
+        best_Q = torch.where(better, L, best_Q)
+
+    # Candidate 0: collapse the whole group to its Hessian-weighted mean. This
+    # is the optimal code for a (near-)constant group, where the LS solve below
+    # is degenerate.
+    _consider(torch.zeros_like(w),
+              torch.full((out_features, 1), 1e-8, dtype=w.dtype, device=w.device),
+              sx / sw)
+
+    # -- Scale search (brings k-quant's make_qkx2 robustness to DASH-Q) --
+    # Sweep candidate ranges around min-max; for each, assign integer codes and
+    # solve Eq. 10/11 in closed form, keeping whichever minimises the
+    # Hessian-weighted error per row. Outliers no longer dictate the scale.
+    n_steps, r_min, r_delta = 40, -2.0, 0.1
+    for i in range(n_steps + 1):
+        iscale = (r_min + r_delta * i + q_max) / rng
+        L = torch.clamp(torch.round(iscale * (w - w_min)), 0, q_max)
+        scale, minv = _solve(L)
+        _consider(L, scale, minv)
+
+    # -- Coordinate-descent refinement from the best candidate (Algorithm 1) --
+    scale, minv = best_s.clone(), -best_z
     for _t in range(T):
-        # Step 1 -- Integer Refinement:  fix (s, z), update Q
-        Q = torch.clamp(torch.round((W_group + z) / s), 0, q_max)
+        L = torch.clamp(torch.round((w - minv) / scale), 0, q_max)
+        scale, minv = _solve(L)
+        _consider(L, scale, minv)
 
-        # Step 2 -- Parameter Regression:  fix Q, update (s, z)
-        q_bar = (Q * H_group).sum(dim=1, keepdim=True) / H_sum
-
-        # Weighted covariance Cov_h(w, q) and variance Var_h(q)
-        cov_wq = (H_group * (W_group - w_bar) * (Q - q_bar)).sum(
-            dim=1, keepdim=True
-        ) / H_sum
-        var_q = (H_group * (Q - q_bar) ** 2).sum(dim=1, keepdim=True) / H_sum
-
-        # Closed-form optimal scale (Eq. 10)
-        s_new = cov_wq / (var_q + lambda_reg)
-        s_new = torch.clamp(s_new, min=1e-8)
-
-        # Closed-form optimal zero-point (Eq. 11)
-        z_new = s_new * q_bar - w_bar
-
-        # alpha-damping: blend new solution with previous iterate
-        s = alpha * s_new + (1 - alpha) * s
-        z = alpha * z_new + (1 - alpha) * z
-
-    # -- Final integer refinement --
-    Q = torch.clamp(torch.round((W_group + z) / s), 0, q_max)
-    return Q, s, z
+    return best_Q, best_s, best_z
 
 
 def quantize_layer(
