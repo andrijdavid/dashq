@@ -63,6 +63,26 @@ _F32_TENSOR_KEYS = (
 )
 
 
+def runtime_force_f32(base_model, ggml_name, bid, data_torch):
+    """True for tensors the *runtime* requires in F32 (not merely a converter
+    quality preference).
+
+    These are the structural ones: 1D tensors (norms/biases), `_norm.weight`,
+    anything that is not a `.weight`/LoRA matrix, and the categories several CPU
+    kernels assert on (SSM conv, time-mix, ...). Quantising any of these trips
+    GGML_ASSERT at inference. Everything else (including the token embedding) is
+    safe to quantise, which is what llama-quantize does too.
+    """
+    n_dims = len(data_torch.shape)
+    if (n_dims <= 1
+            or ggml_name.endswith("_norm.weight")
+            or ggml_name[-7:] not in (".weight", ".lora_a", ".lora_b")):
+        return True
+    keys = [getattr(gguf.MODEL_TENSOR, k) for k in _F32_TENSOR_KEYS
+            if hasattr(gguf.MODEL_TENSOR, k)]
+    return any(base_model.match_model_tensor_name(ggml_name, key, bid) for key in keys)
+
+
 def nonquant_array(base_model, hf_name, ggml_name, bid, data_torch):
     """Numpy array for a tensor DASH-Q leaves unquantised, picking F16 vs F32
     with the same rules llama.cpp's converter applies in prepare_tensors().
@@ -74,22 +94,39 @@ def nonquant_array(base_model, hf_name, ggml_name, bid, data_torch):
     """
     n_dims = len(data_torch.shape)
     qtype = base_model.tensor_force_quant(hf_name, ggml_name, bid, n_dims)
-
-    force_f32 = (
-        n_dims <= 1
-        or ggml_name.endswith("_norm.weight")
-        or ggml_name[-7:] not in (".weight", ".lora_a", ".lora_b")
-    )
-    if not force_f32 and qtype is False:
-        keys = [getattr(gguf.MODEL_TENSOR, k) for k in _F32_TENSOR_KEYS
-                if hasattr(gguf.MODEL_TENSOR, k)]
-        force_f32 = any(
-            base_model.match_model_tensor_name(ggml_name, key, bid) for key in keys
-        )
+    force_f32 = runtime_force_f32(base_model, ggml_name, bid, data_torch)
 
     if force_f32 or qtype == gguf.GGMLQuantizationType.F32:
         return data_torch.to(torch.float32).numpy()
     return data_torch.to(torch.float16).numpy()
+
+
+def native_pack(Q, S, Z, bits):
+    """Pack DASH-Q codes/scales/zeros into the native DASHQ_2/DASHQ_3 block
+    bytes. Returns (raw_data, gguf_type, byte_shape) ready for add_tensor.
+    """
+    n_rows, n_cols = Q.shape
+    native_gs = 32 if bits == 2 else 64
+    assert n_cols % native_gs == 0, (
+        f"in_features ({n_cols}) not divisible by native group size {native_gs}"
+    )
+    Q_grouped = Q.cpu().numpy().astype(np.uint8).reshape(-1, native_gs)
+    S_flat = S.cpu().numpy().astype(np.float32).flatten()
+    Z_flat = Z.cpu().numpy().astype(np.float32).flatten()
+    n_groups_total = n_rows * (n_cols // native_gs)
+    assert (Q_grouped.shape[0] == n_groups_total
+            and S_flat.shape[0] == n_groups_total
+            and Z_flat.shape[0] == n_groups_total), \
+        "Q/S/Z group counts disagree -- check group_size and tensor shapes"
+
+    if bits == 2:
+        raw_bytes = pack_dashq_2(S_flat, Z_flat, Q_grouped)
+        native_type = gguf.GGMLQuantizationType.DASHQ_2
+    else:
+        raw_bytes = pack_dashq_3(S_flat, Z_flat, Q_grouped)
+        native_type = gguf.GGMLQuantizationType.DASHQ_3
+    bshape = np.array([n_rows, n_cols], dtype=np.int64)
+    return np.frombuffer(raw_bytes, dtype=np.uint8), native_type, bshape
 
 
 # -----------------------------------------------------------------------
@@ -369,37 +406,7 @@ def quantize_and_export(
         # Pack weights into GGUF tensor format
         if native and bits in (2, 3):
             # Native DASH-Q format -- no re-quantisation loss
-            n_rows, n_cols = W.shape
-            Q_np = Q.cpu().numpy().astype(np.uint8)
-            S_np = S.cpu().numpy().astype(np.float32)
-            Z_np = Z.cpu().numpy().astype(np.float32)
-
-            native_gs = 32 if bits == 2 else 64
-            assert n_cols % native_gs == 0, (
-                f"in_features ({n_cols}) not divisible by native group size {native_gs}"
-            )
-            n_groups_total = n_rows * (n_cols // native_gs)
-            Q_grouped = Q_np.reshape(-1, native_gs)
-            S_flat = S_np.flatten()
-            Z_flat = Z_np.flatten()
-            assert (
-                Q_grouped.shape[0] == n_groups_total
-                and S_flat.shape[0] == n_groups_total
-                and Z_flat.shape[0] == n_groups_total
-            ), "Q/S/Z group counts disagree -- check group_size and tensor shapes"
-
-            if bits == 2:
-                raw_bytes = pack_dashq_2(S_flat, Z_flat, Q_grouped)
-                native_type = gguf.GGMLQuantizationType.DASHQ_2
-            else:
-                raw_bytes = pack_dashq_3(S_flat, Z_flat, Q_grouped)
-                native_type = gguf.GGMLQuantizationType.DASHQ_3
-
-            # Logical (out, in) shape -- gguf_writer keeps this as-is for DASHQ types.
-            bshape = np.array([n_rows, n_cols], dtype=np.int64)
-
-            raw_data = np.frombuffer(raw_bytes, dtype=np.uint8)
-            quantized_hf_layers[name + ".weight"] = (raw_data, native_type, bshape)
+            quantized_hf_layers[name + ".weight"] = native_pack(Q, S, Z, bits)
         else:
             # Standard K-quant repacking path (dequant -> repack)
             W_hat = dequantize(Q, S, Z, dashq_group_size)
@@ -419,7 +426,8 @@ def quantize_and_export(
     # -- Write all tensors to GGUF -----------------------------------------
     print("\nWriting GGUF file...")
     from itertools import chain
-    
+    native_gs = 32 if bits == 2 else 64
+
     # Iterate over all tensors from the original HF model via convert_hf_to_gguf
     for hf_name, data_torch in chain(base_model.generate_extra_tensors(), base_model.get_tensors()):
         # skip useless ones
@@ -431,16 +439,35 @@ def quantize_and_export(
             if part.isdecimal():
                 bid = int(part)
                 break
-                
+
         for ggml_name, mapped_data_torch in base_model.modify_tensors(data_torch, hf_name, bid):
             if hf_name in quantized_hf_layers:
-                # Write quantized tensor
+                # Write activation-aware quantised linear (from the loop above).
                 raw_data, dtype, shape = quantized_hf_layers[hf_name]
                 writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
+            elif (native and bits in (2, 3)
+                  and mapped_data_torch.ndim == 2
+                  and mapped_data_torch.shape[1] % native_gs == 0
+                  and not runtime_force_f32(base_model, ggml_name, bid, mapped_data_torch)):
+                # Passthrough 2D weight we can still compress: the token
+                # embedding / output and any layer the module loop missed.
+                # There are no activations for an embedding lookup, so weight
+                # it uniformly (what k-quant does for these too).
+                Wt = mapped_data_torch.to(torch.float32).to(device)
+                Ht = torch.ones(Wt.shape[1], dtype=torch.float32, device=Wt.device)
+                Qe, Se, Ze = quantize_layer_from_hessian(
+                    Wt, Ht, b=bits, group_size=native_gs, T=iters, lambda_reg=lambda_reg)
+                raw_data, dtype, shape = native_pack(Qe, Se, Ze, bits)
+                writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
+                print(f"  quantised passthrough {ggml_name} "
+                      f"{tuple(mapped_data_torch.shape)} -> {dtype.name}")
+                del Wt, Ht, Qe, Se, Ze
+                gc.collect()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
             else:
-                # Write original (unquantised) tensor, matching llama.cpp's
-                # F16/F32 choice so SSM/conv/embedding tensors keep the dtype
-                # the runtime asserts on.
+                # Must stay full precision (norms, SSM conv, ...): keep the
+                # exact F16/F32 dtype the runtime asserts on.
                 data_np = nonquant_array(base_model, hf_name, ggml_name, bid, mapped_data_torch)
                 writer.add_tensor(ggml_name, data_np)
 
