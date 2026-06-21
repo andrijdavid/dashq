@@ -74,6 +74,36 @@ def run_rtn(f16: Path, bits: int, out_dir: Path) -> Path:
     return out
 
 
+def ensure_imatrix(f16: Path, calib_file: Path, out_dir: Path, ctx: int,
+                   chunks: int = 128) -> Path:
+    """Compute the importance matrix (per-column diagonal Hessian) once with
+    llama-imatrix, caching the result. --process-output also covers the
+    output/embedding projection.
+    """
+    imat = out_dir / "imatrix.gguf"
+    if imat.exists():
+        return imat
+    bin_ = LLAMA_BIN / "llama-imatrix"
+    run([str(bin_), "-m", str(f16), "-f", str(calib_file),
+         "-o", str(imat), "-c", str(ctx), "--chunks", str(chunks),
+         "--process-output", "--no-ppl"])
+    return imat
+
+
+def run_imatrix(f16: Path, bits: int, out_dir: Path, imatrix_file: Path) -> Path:
+    """Same k-quant target as RTN, but the scale search is weighted by the
+    importance matrix (the diagonal Hessian). Isolates the activation-weighting
+    win at identical granularity and bit budget.
+    """
+    out = out_dir / f"{bits}-imatrix.gguf"
+    if out.exists():
+        return out
+    quantize_bin = LLAMA_BIN / "llama-quantize"
+    run([str(quantize_bin), "--imatrix", str(imatrix_file),
+         str(f16), str(out), RTN_TYPE[bits]])
+    return out
+
+
 def run_dashq(model_id: str, bits: int, out_dir: Path,
               native: bool, n_samples: int, seq_len: int,
               calib_format: str, max_rows: int) -> Path:
@@ -124,7 +154,7 @@ def measure_ppl(gguf: Path, ppl_file: Path, ctx: int, chunks: int = 0) -> dict:
     return {"ppl": ppl, "time_s": dt}
 
 
-ALL_VARIANTS = ["rtn", "dashq-repack", "dashq-native"]
+ALL_VARIANTS = ["rtn", "imatrix", "dashq-repack", "dashq-native"]
 
 
 def variants_for(bits: int, selected: list[str]) -> list[tuple[str, str]]:
@@ -134,6 +164,7 @@ def variants_for(bits: int, selected: list[str]) -> list[tuple[str, str]]:
     can focus on e.g. native vs RTN only.
     """
     catalogue = [("rtn", f"{RTN_TYPE[bits]} (RTN)"),
+                 ("imatrix", f"{RTN_TYPE[bits]} (imatrix/Hessian)"),
                  ("dashq-repack", f"{RTN_TYPE[bits]} (DASH-Q repack)")]
     if bits in (2, 3):
         catalogue.append(("dashq-native", f"DASHQ_{bits} (native)"))
@@ -159,6 +190,10 @@ def main():
     p.add_argument("--no_f16_ppl", action="store_true",
                    help="skip the F16 perplexity row (still converts F16, which RTN needs). "
                         "Use when F16 is not an apples-to-apples comparison point.")
+    p.add_argument("--imatrix_file", default=None,
+                   help="prebuilt GGUF importance matrix for the 'imatrix' variant.")
+    p.add_argument("--imatrix_calib", default=None,
+                   help="text file to compute the imatrix from (if --imatrix_file unset).")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -167,6 +202,11 @@ def main():
 
     print(f"== converting {args.model_id} to F16")
     f16 = ensure_f16(args.model_id, out_dir)
+
+    imatrix_file = Path(args.imatrix_file) if args.imatrix_file else None
+    if "imatrix" in args.variants and imatrix_file is None and args.imatrix_calib:
+        print("== building importance matrix")
+        imatrix_file = ensure_imatrix(f16, Path(args.imatrix_calib), out_dir, args.ctx)
 
     rows = []
     f16_ppl = (measure_ppl(f16, ppl_path, args.ctx, args.ppl_chunks)
@@ -181,6 +221,10 @@ def main():
             try:
                 if tag == "rtn":
                     g = run_rtn(f16, bits, out_dir)
+                elif tag == "imatrix":
+                    if imatrix_file is None:
+                        raise ValueError("imatrix variant needs --imatrix_file or --imatrix_calib")
+                    g = run_imatrix(f16, bits, out_dir, imatrix_file)
                 else:
                     g = run_dashq(args.model_id, bits, out_dir,
                                   native=(tag == "dashq-native"),
