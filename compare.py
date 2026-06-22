@@ -106,8 +106,9 @@ def run_imatrix(f16: Path, bits: int, out_dir: Path, imatrix_file: Path) -> Path
 
 def run_dashq(model_id: str, bits: int, out_dir: Path,
               native: bool, n_samples: int, seq_len: int,
-              calib_format: str, max_rows: int) -> Path:
-    tag = "dashq-native" if native else "dashq-repack"
+              calib_format: str, max_rows: int, kquant: bool = False,
+              dataset: str | None = None) -> Path:
+    tag = "dashq-kquant" if kquant else "dashq-native" if native else "dashq-repack"
     out = out_dir / f"{bits}-{tag}.gguf"
     if out.exists():
         return out
@@ -119,8 +120,12 @@ def run_dashq(model_id: str, bits: int, out_dir: Path,
            "--calib_format", calib_format,
            "--max_rows", str(max_rows),
            "--out", str(out)]
+    if dataset:
+        cmd += ["--dataset", dataset]
     if native:
         cmd.append("--native")
+    if kquant:
+        cmd.append("--kquant")
     run(cmd)
     return out
 
@@ -154,7 +159,7 @@ def measure_ppl(gguf: Path, ppl_file: Path, ctx: int, chunks: int = 0) -> dict:
     return {"ppl": ppl, "time_s": dt}
 
 
-ALL_VARIANTS = ["rtn", "imatrix", "dashq-repack", "dashq-native"]
+ALL_VARIANTS = ["rtn", "imatrix", "dashq-repack", "dashq-native", "dashq-kquant"]
 
 
 def variants_for(bits: int, selected: list[str]) -> list[tuple[str, str]]:
@@ -168,6 +173,7 @@ def variants_for(bits: int, selected: list[str]) -> list[tuple[str, str]]:
                  ("dashq-repack", f"{RTN_TYPE[bits]} (DASH-Q repack)")]
     if bits in (2, 3):
         catalogue.append(("dashq-native", f"DASHQ_{bits} (native)"))
+        catalogue.append(("dashq-kquant", f"{RTN_TYPE[bits]} (DASH-Q kquant)"))
     return [(t, lbl) for t, lbl in catalogue if t in selected]
 
 
@@ -184,6 +190,7 @@ def main():
     p.add_argument("--n_samples", type=int, default=16)
     p.add_argument("--seq_len", type=int, default=2048)
     p.add_argument("--calib_format", default="raw", choices=["raw", "chat"])
+    p.add_argument("--dataset", default=None, help="HF calibration dataset for the DASH-Q paths")
     p.add_argument("--max_rows", type=int, default=128)
     p.add_argument("--variants", nargs="+", default=ALL_VARIANTS, choices=ALL_VARIANTS,
                    help="which quant paths to build/eval (default: all)")
@@ -228,9 +235,10 @@ def main():
                 else:
                     g = run_dashq(args.model_id, bits, out_dir,
                                   native=(tag == "dashq-native"),
+                                  kquant=(tag == "dashq-kquant"),
                                   n_samples=args.n_samples, seq_len=args.seq_len,
                                   calib_format=args.calib_format,
-                                  max_rows=args.max_rows)
+                                  max_rows=args.max_rows, dataset=args.dataset)
             except subprocess.CalledProcessError as e:
                 print(f"  ! build failed: {e}")
                 rows.append({"bits": bits, "variant": label, "path": "FAILED",

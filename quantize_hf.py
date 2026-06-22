@@ -40,6 +40,7 @@ from dashq.export import (
     byte_shape_for_tensor,
 )
 from dashq.export_native import pack_dashq_2, pack_dashq_3
+from dashq.export_kquant import dashq_q2k, dashq_q3k
 
 # Default calibration dataset. wikitext-2 is the standard for raw-text PTQ
 # (AWQ, GPTQ). For instruction-tuned models we default to alpaca rendered
@@ -127,6 +128,21 @@ def native_pack(Q, S, Z, bits):
         native_type = gguf.GGMLQuantizationType.DASHQ_3
     bshape = np.array([n_rows, n_cols], dtype=np.int64)
     return np.frombuffer(raw_bytes, dtype=np.uint8), native_type, bshape
+
+
+def kquant_pack(W, H, bits):
+    """Pack DASH-Q values into a stock Q2_K/Q3_K block (fine 16-group, runs on
+    unmodified llama.cpp). Returns (raw_data, gguf_type, byte_shape).
+
+    Standard quant types go through the gguf writer's byte->element shape
+    conversion, so raw_shape must be the on-disk byte shape (not [out, in]).
+    """
+    out_f, in_f = W.shape
+    raw, _ = (dashq_q2k if bits == 2 else dashq_q3k)(W, H)
+    dtype = gguf.GGMLQuantizationType.Q2_K if bits == 2 else gguf.GGMLQuantizationType.Q3_K
+    block_size, type_size = gguf.GGML_QUANT_SIZES[dtype]
+    byte_shape = np.array([out_f, (in_f // block_size) * type_size], dtype=np.int64)
+    return raw, dtype, byte_shape
 
 
 # -----------------------------------------------------------------------
@@ -248,12 +264,16 @@ def quantize_and_export(
     seq_len: int = 2048,
     out_file: str = "model-dash-q.gguf",
     native: bool = False,
+    kquant: bool = False,
     calib_format: str = "raw",
     max_rows: int | None = 128,
 ):
     """
     Load a HuggingFace model, quantise all linear layers with DASH-Q,
     and export the result to a GGUF file.
+
+    kquant: pack DASH-Q's values into stock Q2_K/Q3_K blocks (fine 16-group,
+    runs on unmodified llama.cpp), instead of the custom DASHQ_2/3 types.
     """
     if bits not in QUANT_REGISTRY:
         raise ValueError(f"Unsupported --bits={bits}. Choose from {list(QUANT_REGISTRY)}.")
@@ -352,7 +372,12 @@ def quantize_and_export(
     # in_features is not divisible by the DASH-Q group size or the target
     # GGUF block size (Q2_K/Q3_K need multiples of 256, Q4_1 needs 32,
     # native DASHQ_2/3 need 32/64). Skipped layers stay F16.
-    target_block = QUANT_REGISTRY[bits][2] if not (native and bits in (2, 3)) else (32 if bits == 2 else 64)
+    if kquant:
+        target_block = 256  # Q2_K/Q3_K super-block
+    elif native and bits in (2, 3):
+        target_block = 32 if bits == 2 else 64
+    else:
+        target_block = QUANT_REGISTRY[bits][2]
     targets = {}
     for name, module in linear_layers.items():
         if "lm_head" in name:
@@ -395,30 +420,28 @@ def quantize_and_export(
         # Run on the layer's own device (it may live on any shard); the
         # Hessian is already there, and packing moves results to CPU.
         W = module.weight.data.clone().float()
-        Q, S, Z = quantize_layer_from_hessian(
-            W, hessians[name], b=bits,
-            group_size=dashq_group_size,
-            T=iters,
-            alpha=alpha,
-            lambda_reg=lambda_reg,
-        )
-
-        # Pack weights into GGUF tensor format
-        if native and bits in (2, 3):
-            # Native DASH-Q format -- no re-quantisation loss
-            quantized_hf_layers[name + ".weight"] = native_pack(Q, S, Z, bits)
+        if kquant:
+            # DASH-Q values packed into a stock Q2_K/Q3_K block (16-group).
+            quantized_hf_layers[name + ".weight"] = kquant_pack(W, hessians[name], bits)
         else:
-            # Standard K-quant repacking path (dequant -> repack)
-            W_hat = dequantize(Q, S, Z, dashq_group_size)
-            raw_bytes, _, _ = pack_tensor(W_hat, bits)
-            bshape = byte_shape_for_tensor(W.shape, bits)
-            raw_data = np.frombuffer(raw_bytes, dtype=np.uint8)
-
-            quantized_hf_layers[name + ".weight"] = (raw_data, tensor_type, bshape)
+            Q, S, Z = quantize_layer_from_hessian(
+                W, hessians[name], b=bits,
+                group_size=dashq_group_size, T=iters, alpha=alpha, lambda_reg=lambda_reg)
+            if native and bits in (2, 3):
+                # Native DASH-Q format -- no re-quantisation loss
+                quantized_hf_layers[name + ".weight"] = native_pack(Q, S, Z, bits)
+            else:
+                # Standard K-quant repacking path (dequant -> repack)
+                W_hat = dequantize(Q, S, Z, dashq_group_size)
+                raw_bytes, _, _ = pack_tensor(W_hat, bits)
+                bshape = byte_shape_for_tensor(W.shape, bits)
+                quantized_hf_layers[name + ".weight"] = (
+                    np.frombuffer(raw_bytes, dtype=np.uint8), tensor_type, bshape)
+            del Q, S, Z
 
         # Free memory
         del hessians[name]
-        del W, Q, S, Z
+        del W
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -427,6 +450,7 @@ def quantize_and_export(
     print("\nWriting GGUF file...")
     from itertools import chain
     native_gs = 32 if bits == 2 else 64
+    pass_block = 256 if kquant else native_gs   # passthrough divisibility requirement
 
     # Iterate over all tensors from the original HF model via convert_hf_to_gguf
     for hf_name, data_torch in chain(base_model.generate_extra_tensors(), base_model.get_tensors()):
@@ -445,9 +469,9 @@ def quantize_and_export(
                 # Write activation-aware quantised linear (from the loop above).
                 raw_data, dtype, shape = quantized_hf_layers[hf_name]
                 writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
-            elif (native and bits in (2, 3)
+            elif ((kquant or (native and bits in (2, 3)))
                   and mapped_data_torch.ndim == 2
-                  and mapped_data_torch.shape[1] % native_gs == 0
+                  and mapped_data_torch.shape[1] % pass_block == 0
                   and not runtime_force_f32(base_model, ggml_name, bid, mapped_data_torch)):
                 # Passthrough 2D weight we can still compress: the token
                 # embedding / output and any layer the module loop missed.
@@ -455,13 +479,17 @@ def quantize_and_export(
                 # it uniformly (what k-quant does for these too).
                 Wt = mapped_data_torch.to(torch.float32).to(device)
                 Ht = torch.ones(Wt.shape[1], dtype=torch.float32, device=Wt.device)
-                Qe, Se, Ze = quantize_layer_from_hessian(
-                    Wt, Ht, b=bits, group_size=native_gs, T=iters, lambda_reg=lambda_reg)
-                raw_data, dtype, shape = native_pack(Qe, Se, Ze, bits)
+                if kquant:
+                    raw_data, dtype, shape = kquant_pack(Wt, Ht, bits)
+                else:
+                    Qe, Se, Ze = quantize_layer_from_hessian(
+                        Wt, Ht, b=bits, group_size=native_gs, T=iters, lambda_reg=lambda_reg)
+                    raw_data, dtype, shape = native_pack(Qe, Se, Ze, bits)
+                    del Qe, Se, Ze
                 writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
                 print(f"  quantised passthrough {ggml_name} "
                       f"{tuple(mapped_data_torch.shape)} -> {dtype.name}")
-                del Wt, Ht, Qe, Se, Ze
+                del Wt, Ht
                 gc.collect()
                 if device == "cuda":
                     torch.cuda.empty_cache()
@@ -507,6 +535,9 @@ if __name__ == "__main__":
                         help="Output GGUF file name")
     parser.add_argument("--native", action="store_true", default=False,
                         help="Use native DASHQ_2/DASHQ_3 block format (requires forked llama.cpp)")
+    parser.add_argument("--kquant", action="store_true", default=False,
+                        help="Pack DASH-Q values into stock Q2_K/Q3_K blocks (16-group, "
+                             "runs on unmodified llama.cpp)")
     parser.add_argument("--calib_format", type=str, default="raw", choices=["raw", "chat"],
                         help="Calibration format: 'raw' (concat text) or 'chat' "
                              "(instruction/answer rendered via the tokenizer chat template)")
@@ -528,6 +559,7 @@ if __name__ == "__main__":
         seq_len=args.seq_len,
         out_file=args.out,
         native=args.native,
+        kquant=args.kquant,
         calib_format=args.calib_format,
         max_rows=args.max_rows if args.max_rows > 0 else None,
     )
