@@ -263,8 +263,7 @@ def quantize_and_export(
     n_samples: int = 16,
     seq_len: int = 2048,
     out_file: str = "model-dash-q.gguf",
-    native: bool = False,
-    kquant: bool = False,
+    method: str = "repack",
     calib_format: str = "raw",
     max_rows: int | None = 128,
 ):
@@ -272,9 +271,14 @@ def quantize_and_export(
     Load a HuggingFace model, quantise all linear layers with DASH-Q,
     and export the result to a GGUF file.
 
-    kquant: pack DASH-Q's values into stock Q2_K/Q3_K blocks (fine 16-group,
-    runs on unmodified llama.cpp), instead of the custom DASHQ_2/3 types.
+    method (how DASH-Q's scales are stored; all are experimental, the project's
+    best result is plain llama.cpp imatrix quantisation, see README):
+      repack - dequantise then re-pack into Q2_K/Q3_K/Q4_1 (default)
+      native - custom DASHQ_2/DASHQ_3 blocks (needs the llama.cpp fork)
+      kquant - DASH-Q values packed straight into stock Q2_K/Q3_K (16-group)
     """
+    native = method == "native"
+    kquant = method == "kquant"
     if bits not in QUANT_REGISTRY:
         raise ValueError(f"Unsupported --bits={bits}. Choose from {list(QUANT_REGISTRY)}.")
 
@@ -528,11 +532,12 @@ if __name__ == "__main__":
                         help="Sequence length for calibration")
     parser.add_argument("--out", type=str, default="model-dash-q.gguf",
                         help="Output GGUF file name")
-    parser.add_argument("--native", action="store_true", default=False,
-                        help="Use native DASHQ_2/DASHQ_3 block format (requires forked llama.cpp)")
-    parser.add_argument("--kquant", action="store_true", default=False,
-                        help="Pack DASH-Q values into stock Q2_K/Q3_K blocks (16-group, "
-                             "runs on unmodified llama.cpp)")
+    parser.add_argument("--method", choices=["repack", "native", "kquant"], default="repack",
+                        help="repack: dequant+repack to Q2_K/Q3_K/Q4_1 (default). "
+                             "native: custom DASHQ_2/3 blocks (needs the llama.cpp fork at "
+                             "https://github.com/andrijdavid/llama.cpp branch dashq-quant). "
+                             "kquant: DASH-Q values in stock Q2_K/Q3_K (16-group). "
+                             "All experimental; see README for the recommended path.")
     parser.add_argument("--calib_format", type=str, default="raw", choices=["raw", "chat"],
                         help="Calibration format: 'raw' (concat text) or 'chat' "
                              "(instruction/answer rendered via the tokenizer chat template)")
@@ -553,8 +558,7 @@ if __name__ == "__main__":
         n_samples=args.n_samples,
         seq_len=args.seq_len,
         out_file=args.out,
-        native=args.native,
-        kquant=args.kquant,
+        method=args.method,
         calib_format=args.calib_format,
         max_rows=args.max_rows if args.max_rows > 0 else None,
     )

@@ -1,26 +1,27 @@
 """
-Compare DASH-Q variants against stock-llama.cpp baselines at matched bitwidths.
+Quantise a model and compare quant methods at matched bitwidths.
 
-For each `--bits` and each path (stock RTN, DASH-Q repack, DASH-Q native), the
-script:
-  1. produces the GGUF file (skips if it already exists),
-  2. records the on-disk size,
-  3. optionally runs `llama-perplexity` against a wikitext-style file,
-  4. tabulates everything to stdout (and a markdown file).
+For each `--bits` and each selected variant the script produces the GGUF, records
+its size, optionally runs `llama-perplexity`, and tabulates the result (stdout +
+markdown). Outputs land in `--out_dir` as `<bits>-<variant>.gguf`.
 
-Outputs land in `--out_dir`. Each variant is one .gguf file named
-`<bits>-<variant>.gguf`.
+Default variant is the project's best result: `imatrix` (DASH-Q's diagonal
+Hessian fed to `llama-quantize` as an importance matrix) plus the `rtn` baseline.
+
+Variants:
+- rtn          : plain `llama-quantize` Q2_K/Q3_K/Q4_1 (no calibration).
+- imatrix      : same k-quant, weighted by the diagonal Hessian. RECOMMENDED.
+- dashq-repack : DASH-Q solver, dequant+repack into the k-quant block.
+- dashq-native : DASH-Q solver in custom DASHQ_2/3 blocks (needs the llama.cpp
+                 fork, https://github.com/andrijdavid/llama.cpp branch dashq-quant).
+- dashq-kquant : DASH-Q solver packed straight into stock Q2_K/Q3_K (16-group).
+
+The dashq-* paths are experimental: they beat plain RTN but lose to imatrix
+(see README findings).
 
 Typical use:
-    uv run python compare.py --model_id Qwen/Qwen2.5-0.5B \
-        --bits 2 3 4 \
-        --ppl_file llama.cpp/build/wikitext-2-raw/wiki.test.raw
-
-Notes:
-- The "rtn" baseline runs `llama-quantize` against an F16 conversion. It is the
-  same target format as the "dashq-repack" variant, isolating DASH-Q's value-add.
-- "dashq-native" is only available for bits 2 and 3; bits 4 has no native type.
-- F16 reference is generated once and reused as the perplexity baseline.
+    uv run python compare.py --model_id Qwen/Qwen2.5-0.5B --bits 2 3 \
+        --ppl_file wiki.test.raw --imatrix_calib wiki.train.raw
 """
 
 import argparse
@@ -112,6 +113,7 @@ def run_dashq(model_id: str, bits: int, out_dir: Path,
     out = out_dir / f"{bits}-{tag}.gguf"
     if out.exists():
         return out
+    method = "kquant" if kquant else "native" if native else "repack"
     cmd = [PYTHON, str(REPO / "quantize_hf.py"),
            "--model_id", model_id,
            "--bits", str(bits),
@@ -119,13 +121,10 @@ def run_dashq(model_id: str, bits: int, out_dir: Path,
            "--seq_len", str(seq_len),
            "--calib_format", calib_format,
            "--max_rows", str(max_rows),
+           "--method", method,
            "--out", str(out)]
     if dataset:
         cmd += ["--dataset", dataset]
-    if native:
-        cmd.append("--native")
-    if kquant:
-        cmd.append("--kquant")
     run(cmd)
     return out
 
@@ -192,8 +191,10 @@ def main():
     p.add_argument("--calib_format", default="raw", choices=["raw", "chat"])
     p.add_argument("--dataset", default=None, help="HF calibration dataset for the DASH-Q paths")
     p.add_argument("--max_rows", type=int, default=128)
-    p.add_argument("--variants", nargs="+", default=ALL_VARIANTS, choices=ALL_VARIANTS,
-                   help="which quant paths to build/eval (default: all)")
+    p.add_argument("--variants", nargs="+", default=["rtn", "imatrix"], choices=ALL_VARIANTS,
+                   help="which quant paths to build/eval. Default is the recommended "
+                        "imatrix (DASH-Q Hessian -> llama-quantize) plus its RTN baseline. "
+                        "dashq-repack/native/kquant are the experimental DASH-Q packers.")
     p.add_argument("--no_f16_ppl", action="store_true",
                    help="skip the F16 perplexity row (still converts F16, which RTN needs). "
                         "Use when F16 is not an apples-to-apples comparison point.")
