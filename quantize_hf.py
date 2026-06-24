@@ -450,7 +450,6 @@ def quantize_and_export(
     print("\nWriting GGUF file...")
     from itertools import chain
     native_gs = 32 if bits == 2 else 64
-    pass_block = 256 if kquant else native_gs   # passthrough divisibility requirement
 
     # Iterate over all tensors from the original HF model via convert_hf_to_gguf
     for hf_name, data_torch in chain(base_model.generate_extra_tensors(), base_model.get_tensors()):
@@ -469,27 +468,23 @@ def quantize_and_export(
                 # Write activation-aware quantised linear (from the loop above).
                 raw_data, dtype, shape = quantized_hf_layers[hf_name]
                 writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
-            elif ((kquant or (native and bits in (2, 3)))
+            elif (native and bits in (2, 3)
                   and mapped_data_torch.ndim == 2
-                  and mapped_data_torch.shape[1] % pass_block == 0
+                  and mapped_data_torch.shape[1] % native_gs == 0
                   and not runtime_force_f32(base_model, ggml_name, bid, mapped_data_torch)):
-                # Passthrough 2D weight we can still compress: the token
-                # embedding / output and any layer the module loop missed.
-                # There are no activations for an embedding lookup, so weight
-                # it uniformly (what k-quant does for these too).
+                # Native path only: compress passthrough 2D weights (embedding /
+                # output). kquant deliberately leaves these high precision so the
+                # comparison isolates the transformer-layer quantiser (a 2-bit
+                # tied embedding otherwise costs ~+30 PPL and confounds it).
                 Wt = mapped_data_torch.to(torch.float32).to(device)
                 Ht = torch.ones(Wt.shape[1], dtype=torch.float32, device=Wt.device)
-                if kquant:
-                    raw_data, dtype, shape = kquant_pack(Wt, Ht, bits)
-                else:
-                    Qe, Se, Ze = quantize_layer_from_hessian(
-                        Wt, Ht, b=bits, group_size=native_gs, T=iters, lambda_reg=lambda_reg)
-                    raw_data, dtype, shape = native_pack(Qe, Se, Ze, bits)
-                    del Qe, Se, Ze
+                Qe, Se, Ze = quantize_layer_from_hessian(
+                    Wt, Ht, b=bits, group_size=native_gs, T=iters, lambda_reg=lambda_reg)
+                raw_data, dtype, shape = native_pack(Qe, Se, Ze, bits)
                 writer.add_tensor(ggml_name, raw_data, raw_dtype=dtype, raw_shape=shape)
                 print(f"  quantised passthrough {ggml_name} "
                       f"{tuple(mapped_data_torch.shape)} -> {dtype.name}")
-                del Wt, Ht
+                del Wt, Ht, Qe, Se, Ze
                 gc.collect()
                 if device == "cuda":
                     torch.cuda.empty_cache()
